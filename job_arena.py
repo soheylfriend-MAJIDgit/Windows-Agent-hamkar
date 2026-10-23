@@ -14,6 +14,8 @@
 # متن ابتدا داخل کلیپ‌بورد گذاشته می‌شود و بعد با Ctrl+V جای‌گذاری می‌شود.
 # نکته فنی ۲: تشخیص متن و کلیک روی دکمه‌ها با UI Automation داخلی ویندوز
 # (UIAutomationClient) از داخل PowerShell انجام می‌شود، نه با پکیج پایتونی.
+# نکته فنی ۳: کادر چت فقط داخل درخت صفحه وب جستجو می‌شود تا نوار آدرس مرورگر
+# (که خودش یک کنترل Edit است) اشتباهی به‌عنوان کادر چت انتخاب نشود.
 
 import os
 import subprocess
@@ -225,11 +227,13 @@ def handle_dialog_if_present():
 
 # اسکریپت UI Automation برای تایپ و ارسال — چند راهبرد پشت سر هم با تأیید خودکار:
 #   ۱) پنجره مرورگر فعال (Foreground) می‌شود
-#   ۲) کادر چت بین کنترل‌های Edit و Documentِ قابل‌مشاهده پیدا می‌شود
-#   ۳) راهبرد اول: ValuePattern.SetValue (بدون کیبورد/کلیپ‌بورد)
-#   ۴) راهبرد دوم: فوکوس + کلیک + Paste سخت‌افزاری (keybd_event Ctrl+V)
-#   ۵) بعد از هر تلاش، متن داخل کادر خوانده و تأیید می‌شود
-#   ۶) ارسال: Enter سخت‌افزاری → دکمه Send → SendKeys؛ هرکدام با تأیید خالی شدن کادر
+#   ۲) نگهبان URL: اگر تب از arena.ai خارج شده، دوباره لینک باز می‌شود
+#   ۳) کادر چت فقط داخل درخت صفحه وب (بزرگ‌ترین Document) جستجو می‌شود تا نوار آدرس
+#      مرورگر (omnibox) که خودش یک کنترل Edit است اشتباهی انتخاب نشود
+#   ۴) راهبرد اول: ValuePattern.SetValue (بدون کیبورد/کلیپ‌بورد)
+#   ۵) راهبرد دوم: فوکوس + کلیک + Paste سخت‌افزاری (keybd_event Ctrl+V)
+#   ۶) بعد از هر تلاش، متن داخل کادر خوانده و تأیید می‌شود
+#   ۷) ارسال: Enter سخت‌افزاری → دکمه Send → SendKeys؛ هرکدام با تأیید پاک شدن متن
 TYPE_PS_SCRIPT = r"""
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
@@ -292,29 +296,6 @@ function Get-ElText($el) {
     return $null
 }
 
-$browserNames = @('chrome','msedge','firefox','brave','opera','vivaldi')
-$root = [System.Windows.Automation.AutomationElement]::RootElement
-$topWindows = $root.FindAll([System.Windows.Automation.TreeScope]::Children, [System.Windows.Automation.Condition]::TrueCondition)
-
-$foregroundHandle = [WinApi]::GetForegroundWindow()
-$browserWin = $null
-$lastBrowser = $null
-foreach ($win in $topWindows) {
-    $proc = Get-Process -Id $win.Current.ProcessId -ErrorAction SilentlyContinue
-    if ($proc -and ($browserNames -contains $proc.ProcessName)) {
-        $lastBrowser = $win
-        if ($win.Current.NativeWindowHandle -eq $foregroundHandle) { $browserWin = $win }
-    }
-}
-if (-not $browserWin) { $browserWin = $lastBrowser }
-if (-not $browserWin) { Write-Output 'ARENA_NO_BROWSER'; exit 0 }
-
-# مرورگر را پیش‌زمینه کن تا ورودی‌ها قطعاً به آن برسد
-try { [WinApi]::SetForegroundWindow($browserWin.Current.NativeWindowHandle) | Out-Null } catch {}
-Start-Sleep -Milliseconds 500
-Write-Output 'ARENA_BROWSER_FG'
-
-# جمع‌آوری کادرهای قابل‌مشاهده: اول Editها، اگر نبود Documentها (کادر contenteditable)
 function Get-Visible($elements) {
     $list = @()
     foreach ($el in $elements) {
@@ -326,19 +307,110 @@ function Get-Visible($elements) {
     return $list
 }
 
-$editCond = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Edit)
-$docCond = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Document)
-$edits = Get-Visible ($browserWin.FindAll([System.Windows.Automation.TreeScope]::Descendants, $editCond))
-$docs = Get-Visible ($browserWin.FindAll([System.Windows.Automation.TreeScope]::Descendants, $docCond))
-Write-Output ("ARENA_CANDIDATES=" + $edits.Count + " edits, " + $docs.Count + " docs")
+# تشخیص نوار آدرس/جستجوی خود مرورگر تا با کادر چت اشتباه گرفته نشود
+function Test-Omnibox($el, $winTop) {
+    try {
+        $r = $el.Current.BoundingRectangle
+        $n = [string]$el.Current.Name
+        if ($r.Top -le ($winTop + 120)) { return $true }
+        if ($n -and ($n -match 'address|search bar|آدرس|نوار')) { return $true }
+    } catch {}
+    return $false
+}
 
+$browserNames = @('chrome','msedge','firefox','brave','opera','vivaldi')
 $composer = $null
-if ($edits.Count -gt 0) { $composer = $edits[$edits.Count - 1] }
-elseif ($docs.Count -gt 0) { $composer = $docs[$docs.Count - 1] }
-
+$page = $null
+$browserWin = $null
 $textInComposer = $false
 
-if ($composer) {
+# دو round: اول عادی؛ اگر نگهبان URL مجبور به باز کردن دوباره صفحه شد، round دوم
+for ($round = 1; $round -le 2 -and -not $textInComposer; $round++) {
+    $root = [System.Windows.Automation.AutomationElement]::RootElement
+    $topWindows = $root.FindAll([System.Windows.Automation.TreeScope]::Children, [System.Windows.Automation.Condition]::TrueCondition)
+
+    $foregroundHandle = [WinApi]::GetForegroundWindow()
+    $browserWin = $null
+    $lastBrowser = $null
+    foreach ($win in $topWindows) {
+        $proc = Get-Process -Id $win.Current.ProcessId -ErrorAction SilentlyContinue
+        if ($proc -and ($browserNames -contains $proc.ProcessName)) {
+            $lastBrowser = $win
+            if ($win.Current.NativeWindowHandle -eq $foregroundHandle) { $browserWin = $win }
+        }
+    }
+    if (-not $browserWin) { $browserWin = $lastBrowser }
+    if (-not $browserWin) { Write-Output 'ARENA_NO_BROWSER'; exit 0 }
+
+    # مرورگر را پیش‌زمینه کن تا ورودی‌ها قطعاً به آن برسد
+    try { [WinApi]::SetForegroundWindow($browserWin.Current.NativeWindowHandle) | Out-Null } catch {}
+    Start-Sleep -Milliseconds 500
+    Write-Output 'ARENA_BROWSER_FG'
+
+    $winRect = $browserWin.Current.BoundingRectangle
+    $editCond = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Edit)
+    $docCond = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Document)
+    $winEdits = Get-Visible ($browserWin.FindAll([System.Windows.Automation.TreeScope]::Descendants, $editCond))
+
+    # نگهبان URL: مقدار نوار آدرس را بخوان؛ اگر روی arena.ai نیستیم، صفحه را دوباره باز کن
+    $omnibox = $null
+    foreach ($e in $winEdits) {
+        if (Test-Omnibox $e $winRect.Top) { $omnibox = $e; break }
+    }
+    if ($omnibox) {
+        $urlText = Get-ElText $omnibox
+        if ($urlText -and ($urlText -notmatch 'arena\.ai')) {
+            Write-Output 'ARENA_URL_GUARD_REOPEN'
+            Start-Process $env:ARENA_URL | Out-Null
+            Start-Sleep -Seconds 12
+            continue
+        }
+    }
+
+    # بزرگ‌ترین Document قابل‌مشاهده = خود صفحه وب (نه نوار ابزار مرورگر)
+    $docs = Get-Visible ($browserWin.FindAll([System.Windows.Automation.TreeScope]::Descendants, $docCond))
+    $page = $null
+    $maxArea = 0
+    foreach ($d in $docs) {
+        $r = $d.Current.BoundingRectangle
+        $area = $r.Width * $r.Height
+        if ($area -gt $maxArea) { $maxArea = $area; $page = $d }
+    }
+    Write-Output ("ARENA_CANDIDATES=" + $winEdits.Count + " window edits, " + $docs.Count + " docs")
+
+    # کادرهای Edit فقط داخل درخت صفحه وب جستجو می‌شوند؛ نوار آدرس اینجا اصلاً وجود ندارد
+    $pageEdits = @()
+    if ($page) { $pageEdits = Get-Visible ($page.FindAll([System.Windows.Automation.TreeScope]::Descendants, $editCond)) }
+    $safeEdits = @()
+    foreach ($e in $pageEdits) {
+        if (Test-Omnibox $e $winRect.Top) { continue }
+        $safeEdits += $e
+    }
+
+    if ($safeEdits.Count -gt 0) {
+        # پایین‌ترین کادر ویرایشی صفحه = کادر چت
+        $composer = $safeEdits[0]
+        foreach ($e in $safeEdits) {
+            if ($e.Current.BoundingRectangle.Top -gt $composer.Current.BoundingRectangle.Top) { $composer = $e }
+        }
+        Write-Output 'ARENA_COMPOSER_EDIT_IN_DOC'
+    } elseif ($page) {
+        # کادر چت contenteditable است و خودش را به‌صورت Document نشان می‌دهد
+        $composer = $page
+        Write-Output 'ARENA_COMPOSER_DOCUMENT'
+    } else {
+        # آخرین راهبرد: کلیک روی ناحیه کادر چت در پایین-وسط پنجره و Paste
+        Left-Click ($winRect.X + $winRect.Width / 2) ($winRect.Bottom - 80)
+        Start-Sleep -Milliseconds 500
+        Set-Clipboard -Value $env:ARENA_PROMPT
+        Start-Sleep -Milliseconds 300
+        Hardware-Paste
+        Write-Output 'ARENA_FALLBACK_CLICK_PASTE'
+        Start-Sleep -Milliseconds 900
+        $textInComposer = $true
+        break
+    }
+
     # راهبرد اول: نوشتن مستقیم با ValuePattern (رویدادهای ورودی واقعی مرورگر را فعال می‌کند)
     try {
         $vp = $null
@@ -383,26 +455,16 @@ if ($composer) {
             }
         }
     }
-} else {
-    # هیچ کادری شناسایی نشد؛ کلیک روی ناحیه کادر چت در پایین-وسط پنجره و Paste
-    $r = $browserWin.Current.BoundingRectangle
-    Left-Click ($r.X + $r.Width / 2) ($r.Bottom - 80)
-    Start-Sleep -Milliseconds 500
-    Set-Clipboard -Value $env:ARENA_PROMPT
-    Start-Sleep -Milliseconds 300
-    Hardware-Paste
-    Write-Output 'ARENA_FALLBACK_CLICK_PASTE'
-    Start-Sleep -Milliseconds 900
-    $textInComposer = $true
 }
 
 if ($textInComposer) { Write-Output 'ARENA_TEXT_VERIFIED' } else { Write-Output 'ARENA_TEXT_MISSING' }
 
-# ارسال پیام — هر راهبرد با تأیید خالی شدن کادر
-function Composer-Empty {
+# ارسال پیام — هر راهبرد با تأیید پاک شدن متن از کادر
+function Composer-Cleared {
     if (-not $composer) { return $false }
     $t = Get-ElText $composer
-    return ([string]::IsNullOrWhiteSpace($t))
+    if (-not $t) { return $true }
+    return (-not $t.Contains($env:ARENA_PROMPT))
 }
 
 $sent = $false
@@ -410,15 +472,17 @@ $sent = $false
 # ۱) Enter سخت‌افزاری
 Hardware-Enter
 Start-Sleep -Milliseconds 1200
-if (Composer-Empty) {
+if (Composer-Cleared) {
     $sent = $true
     Write-Output 'ARENA_SUBMIT_ENTER'
 }
 
-# ۲) دکمه Send
+# ۲) دکمه Send (داخل همان صفحه وب جستجو می‌شود)
 if (-not $sent) {
+    $scope = $browserWin
+    if ($page) { $scope = $page }
     $btnCond = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Button)
-    $buttons = $browserWin.FindAll([System.Windows.Automation.TreeScope]::Descendants, $btnCond)
+    $buttons = $scope.FindAll([System.Windows.Automation.TreeScope]::Descendants, $btnCond)
     $sendBtn = $null
     foreach ($b in $buttons) {
         $n = $b.Current.Name
@@ -434,7 +498,7 @@ if (-not $sent) {
                 Left-Click $pt.X $pt.Y
             }
             Start-Sleep -Milliseconds 1200
-            if (Composer-Empty) { $sent = $true; Write-Output 'ARENA_SUBMIT_BUTTON' }
+            if (Composer-Cleared) { $sent = $true; Write-Output 'ARENA_SUBMIT_BUTTON' }
         } catch {}
     }
 }
@@ -444,7 +508,7 @@ if (-not $sent) {
     try {
         [System.Windows.Forms.SendKeys]::SendWait('~')
         Start-Sleep -Milliseconds 1200
-        if (Composer-Empty) { $sent = $true; Write-Output 'ARENA_SUBMIT_SENDKEYS' }
+        if (Composer-Cleared) { $sent = $true; Write-Output 'ARENA_SUBMIT_SENDKEYS' }
     } catch {}
 }
 
@@ -456,12 +520,20 @@ exit 0
 def type_and_submit():
     # متن از طریق متغیر محیطی به پاورشل داده می‌شود تا هیچ مشکل کوتیشن/یونیکدی پیش نیاید.
     output = run_hidden_powershell(
-        TYPE_PS_SCRIPT, extra_env={"ARENA_PROMPT": PROMPT_TEXT}, timeout=90
+        TYPE_PS_SCRIPT,
+        extra_env={"ARENA_PROMPT": PROMPT_TEXT, "ARENA_URL": URL},
+        timeout=120,
     )
     markers = [line.strip() for line in output.splitlines() if line.strip()]
 
     if "ARENA_NO_BROWSER" in output:
         print("هشدار: پنجره مرورگر برای تایپ پیدا نشد")
+    if "ARENA_URL_GUARD_REOPEN" in output:
+        print("هشدار: تب از صفحه Arena خارج شده بود؛ لینک دوباره باز شد")
+    if "ARENA_COMPOSER_DOCUMENT" in output:
+        print("کادر چت از نوع contenteditable تشخیص داده شد")
+    elif "ARENA_COMPOSER_EDIT_IN_DOC" in output:
+        print("کادر چت داخل صفحه وب پیدا شد (نوار آدرس کنار گذاشته شد)")
     if "ARENA_VALUE_SET_OK" in output:
         print("متن به‌صورت مستقیم داخل کادر چت نوشته شد (ValuePattern)")
     elif any(m.startswith("ARENA_PASTE_OK") for m in markers):
@@ -475,7 +547,7 @@ def type_and_submit():
         print("هشدار: حضور متن در کادر چت تأیید نشد")
 
     if "ARENA_SENT_VERIFIED" in output:
-        print("ارسال پیام تأیید شد (کادر چت بعد از ارسال خالی شد)")
+        print("ارسال پیام تأیید شد (متن بعد از ارسال از کادر پاک شد)")
     else:
         print("هشدار: ارسال پیام قطعی تأیید نشد؛ اسکرین‌شات را بررسی کنید")
 
