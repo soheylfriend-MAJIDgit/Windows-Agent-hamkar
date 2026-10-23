@@ -1,14 +1,26 @@
 # job_chatgpt.py
-# تنها کار این فایل: باز کردن سایت چت جی‌پی‌تی در مرورگر پیش‌فرض ویندوز.
+# کار این فایل: باز کردن سایت چت جی‌پی‌تی در مرورگر پیش‌فرض و گرفتن اسکرین‌شات در پایان.
 # فقط کتابخانه‌های استاندارد پایتون — بدون نیاز به pip install.
+# اسکرین‌شات با PowerShell داخلی ویندوز (System.Drawing) گرفته می‌شود.
 # بدون ورودی تعاملی (input) و بدون انتظار برای بسته شدن مرورگر.
 
+import os
+import subprocess
+import time
 import webbrowser
+from datetime import datetime
 
 URL = "https://chatgpt.com"
+JOB_NAME = "chatgpt"
+
+# پوشه ذخیره اسکرین‌شات‌ها (گوگل درایو)
+SCREENSHOT_DIR = r"C:\Users\alibatel\My Drive\Windows-Agent-DB\ScreenShots"
+
+# چند ثانیه صبر برای بارگذاری صفحه پیش از اسکرین‌شات
+WAIT_SECONDS = 8
 
 
-def main():
+def open_site():
     print("در حال باز کردن سایت چت جی‌پی‌تی در مرورگر پیش‌فرض...")
 
     opened = False
@@ -25,6 +37,63 @@ def main():
         webbrowser.open(URL)
 
     print("سایت چت جی‌پی‌تی در مرورگر باز شد")
+
+
+def take_screenshot(path):
+    # اسکریپت PowerShell: تصویر کل صفحه (همه مانیتورها) را به‌صورت PNG ذخیره می‌کند
+    ps_script = f"""
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+$bounds = [System.Windows.Forms.SystemInformation]::VirtualScreen
+$bitmap = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height
+$graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+$graphics.CopyFromScreen($bounds.Left, $bounds.Top, 0, 0, $bitmap.Size)
+$bitmap.Save('{path}', [System.Drawing.Imaging.ImageFormat]::Png)
+$graphics.Dispose()
+$bitmap.Dispose()
+""".strip()
+
+    result = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            ps_script,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    if result.returncode != 0:
+        error = result.stderr.strip() or "خطای ناشناخته در PowerShell"
+        raise RuntimeError(error)
+
+
+def main():
+    # ۱) باز کردن سایت
+    open_site()
+
+    # ۲) صبر برای بارگذاری صفحه پیش از اسکرین‌شات
+    print(f"صبر {WAIT_SECONDS} ثانیه‌ای برای بارگذاری صفحه پیش از اسکرین‌شات...")
+    time.sleep(WAIT_SECONDS)
+
+    # ۳) اطمینان از وجود پوشه اسکرین‌شات‌ها
+    os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+
+    # ۴) گرفتن و ذخیره اسکرین‌شات با نام یکتا (نام کار + زمان اجرا)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    screenshot_path = os.path.join(
+        SCREENSHOT_DIR, f"{JOB_NAME}_{timestamp}.png"
+    )
+
+    try:
+        take_screenshot(screenshot_path)
+        print(f"اسکرین‌شات ذخیره شد: {screenshot_path}")
+    except Exception as exc:
+        # خطای اسکرین‌شات نباید باعث اجرای ناموفق کل کار شود؛ در لاگ ثبت می‌شود
+        print(f"خطا در گرفتن اسکرین‌شات: {exc}")
 
 
 if __name__ == "__main__":
