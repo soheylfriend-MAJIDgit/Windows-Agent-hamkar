@@ -2,14 +2,18 @@
 # کار این فایل:
 #   ۱) باز کردن لینک صفحه Arena در مرورگر پیش‌فرض
 #   ۲) صبر برای بارگذاری کامل صفحه (با فاصله زمانی)
-#   ۳) تایپ متن فارسی در کادر چت و زدن Enter
-#   ۴) گرفتن اسکرین‌شات در پایان
+#   ۳) بررسی وجود پنجره "Was this task successful?":
+#        - اگر نبود → مستقیم سراغ تایپ می‌رود
+#        - اگر بود → آخرین دکمه "Yes" را کلیک می‌کند، کمی صبر می‌کند، بعد تایپ می‌کند
+#   ۴) تایپ متن فارسی در کادر چت و زدن Enter
+#   ۵) گرفتن اسکرین‌شات در پایان
 # فقط کتابخانه‌های استاندارد پایتون — بدون نیاز به pip install.
 # بدون ورودی تعاملی (input) و بدون انتظار برای بسته شدن مرورگر.
 #
-# نکته فنی: SendKeys ویندوز حروف فارسی (یونیکد) را مستقیم تایپ نمی‌کند؛
-# به همین دلیل متن ابتدا داخل کلیپ‌بورد گذاشته می‌شود و بعد با Ctrl+V
-# در کادر فعال چت جای‌گذاری (Paste) می‌شود، سپس Enter زده می‌شود.
+# نکته فنی ۱: SendKeys ویندوز حروف فارسی (یونیکد) را مستقیم تایپ نمی‌کند؛
+# متن ابتدا داخل کلیپ‌بورد گذاشته می‌شود و بعد با Ctrl+V جای‌گذاری می‌شود.
+# نکته فنی ۲: تشخیص متن و کلیک روی دکمه‌ها با UI Automation داخلی ویندوز
+# (UIAutomationClient) از داخل PowerShell انجام می‌شود، نه با پکیج پایتونی.
 
 import os
 import subprocess
@@ -22,6 +26,9 @@ URL = "https://arena.ai/agent/01a16a94-648c-7294-8d19-f276beecb74c"
 # متنی که باید در کادر چت تایپ و ارسال شود
 PROMPT_TEXT = "یک کد دیگه بنویس که سایت ورسل رو باز کنه"
 
+# عبارتی که قبل از تایپ باید در صفحه بررسی شود
+DIALOG_PHRASE = "Was this task successful?"
+
 JOB_NAME = "arena"
 
 # پوشه ذخیره اسکرین‌شات‌ها (گوگل درایو)
@@ -29,6 +36,13 @@ SCREENSHOT_DIR = r"C:\Users\alibatel\My Drive\Windows-Agent-DB\ScreenShots"
 
 # صبر تا صفحه و کادر چت کاملاً بارگذاری شود (قابل تغییر در صورت اینترنت کند)
 PAGE_LOAD_WAIT = 15
+
+# چند بار و با چه فاصله‌ای وجود پنجره تأیید بررسی شود
+DIALOG_CHECK_ATTEMPTS = 3
+DIALOG_CHECK_GAP = 3
+
+# صبر بعد از کلیک روی Yes، پیش از تایپ
+DIALOG_CLICK_WAIT = 3
 
 # صبر بعد از زدن Enter، پیش از گرفتن اسکرین‌شات
 AFTER_ENTER_WAIT = 5
@@ -53,7 +67,7 @@ def open_site():
     print("صفحه Arena در مرورگر باز شد")
 
 
-def run_hidden_powershell(ps_script, extra_env=None):
+def run_hidden_powershell(ps_script, extra_env=None, timeout=60):
     # CREATE_NO_WINDOW + WindowStyle Hidden: پنجره پاورشل روی صفحه باز نمی‌شود
     # تا فوکوس روی مرورگر باقی بماند و کلیدها به کادر چت برسند.
     env = dict(os.environ)
@@ -73,7 +87,7 @@ def run_hidden_powershell(ps_script, extra_env=None):
         ],
         capture_output=True,
         text=True,
-        timeout=60,
+        timeout=timeout,
         creationflags=creation_flags,
         env=env,
     )
@@ -81,6 +95,132 @@ def run_hidden_powershell(ps_script, extra_env=None):
     if result.returncode != 0:
         error = result.stderr.strip() or "خطای ناشناخته در PowerShell"
         raise RuntimeError(error)
+
+    return result.stdout or ""
+
+
+# اسکریپت UI Automation:
+#   - پنجره مرورگرها را پیدا می‌کند
+#   - دنبال متن "Was this task successful?" می‌گردد
+#   - اگر پیدا کرد، همه دکمه‌های Yes را جمع می‌کند و آخرینشان را کلیک می‌کند
+# خروجی: یکی از نشانه‌های ARENA_DIALOG_CLICKED / ARENA_DIALOG_NOT_FOUND /
+# ARENA_DIALOG_FOUND_BUT_NO_YES
+DIALOG_PS_SCRIPT = r"""
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+
+$dialogPhrase = 'WAS_THIS_TASK_SUCCESSFUL'
+$browserNames = @('chrome','msedge','firefox','brave','opera','vivaldi')
+
+$root = [System.Windows.Automation.AutomationElement]::RootElement
+$topWindows = $root.FindAll([System.Windows.Automation.TreeScope]::Children, [System.Windows.Automation.Condition]::TrueCondition)
+
+$dialogWindow = $null
+foreach ($win in $topWindows) {
+    $procId = $win.Current.ProcessId
+    $proc = Get-Process -Id $procId -ErrorAction SilentlyContinue
+    if ($proc -and ($browserNames -contains $proc.ProcessName)) {
+        $textCond = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Text)
+        $texts = $win.FindAll([System.Windows.Automation.TreeScope]::Descendants, $textCond)
+        foreach ($t in $texts) {
+            $name = $t.Current.Name
+            if ($name -and $name.Contains($dialogPhrase)) {
+                $dialogWindow = $win
+                break
+            }
+        }
+        if ($dialogWindow) { break }
+    }
+}
+
+if (-not $dialogWindow) {
+    Write-Output 'ARENA_DIALOG_NOT_FOUND'
+    exit 0
+}
+
+# همه دکمه‌ها و آیتم‌های لیست با نام Yes را جمع می‌کنیم؛ آخرین مورد مد نظر است.
+$btnCond = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Button)
+$itemCond = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::ListItem)
+$orCond = New-Object System.Windows.Automation.OrCondition($btnCond, $itemCond)
+$candidates = $dialogWindow.FindAll([System.Windows.Automation.TreeScope]::Descendants, $orCond)
+
+$yesList = @()
+foreach ($el in $candidates) {
+    if ($el.Current.Name -eq 'Yes') { $yesList += $el }
+}
+
+if ($yesList.Count -eq 0) {
+    Write-Output 'ARENA_DIALOG_FOUND_BUT_NO_YES'
+    exit 0
+}
+
+$lastYes = $yesList[$yesList.Count - 1]
+
+# اول با الگوی Invoke کلیک می‌کنیم (تمیزترین روش)
+$clicked = $false
+try {
+    $pattern = $null
+    if ($lastYes.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$pattern)) {
+        $pattern.Invoke()
+        $clicked = $true
+    }
+} catch {
+    $clicked = $false
+}
+
+# اگر Invoke در دسترس نبود، با انتقال موس به نقطه قابل کلیک و کلیک فیزیکی
+if (-not $clicked) {
+    Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+public class MouseClicker {
+    [DllImport("user32.dll")]
+    public static extern void mouse_event(uint dwFlags, uint dx, uint dy, uint cButtons, uint dwExtraInfo);
+}
+'@
+    $pt = $lastYes.GetClickablePoint()
+    [System.Windows.Forms.Cursor]::Position = New-Object System.Drawing.Point([int]$pt.X, [int]$pt.Y)
+    Start-Sleep -Milliseconds 200
+    [MouseClicker]::mouse_event(2, 0, 0, 0, 0)
+    [MouseClicker]::mouse_event(4, 0, 0, 0, 0)
+}
+
+Write-Output 'ARENA_DIALOG_CLICKED'
+exit 0
+""".replace("WAS_THIS_TASK_SUCCESSFUL", DIALOG_PHRASE)
+
+
+def handle_dialog_if_present():
+    # چند بار بررسی می‌کند چون ممکن است پنجره با کمی تأخیر ظاهر شود.
+    for attempt in range(1, DIALOG_CHECK_ATTEMPTS + 1):
+        print(
+            f"بررسی وجود پنجره «{DIALOG_PHRASE}» "
+            f"(تلاش {attempt} از {DIALOG_CHECK_ATTEMPTS})..."
+        )
+        try:
+            output = run_hidden_powershell(DIALOG_PS_SCRIPT, timeout=60)
+        except Exception as exc:
+            # خطای بررسی نباید کل کار را متوقف کند؛ یک بار دیگر تلاش می‌شود
+            print(f"خطا در بررسی پنجره تأیید: {exc}")
+            output = ""
+
+        if "ARENA_DIALOG_CLICKED" in output:
+            print("پنجره تأیید پیدا شد؛ روی آخرین گزینه Yes کلیک شد")
+            print(f"صبر {DIALOG_CLICK_WAIT} ثانیه‌ای پس از کلیک...")
+            time.sleep(DIALOG_CLICK_WAIT)
+            return True
+
+        if "ARENA_DIALOG_FOUND_BUT_NO_YES" in output:
+            print("پنجره تأیید پیدا شد ولی گزینه Yes قابل کلیک شناسایی نشد؛ ادامه می‌دهیم")
+            return True
+
+        if attempt < DIALOG_CHECK_ATTEMPTS:
+            time.sleep(DIALOG_CHECK_GAP)
+
+    print("پنجره تأیید دیده نشد؛ مستقیم سراغ تایپ متن می‌رویم")
+    return False
 
 
 def type_and_submit():
@@ -124,18 +264,21 @@ def main():
     print(f"صبر {PAGE_LOAD_WAIT} ثانیه‌ای برای بارگذاری کامل صفحه...")
     time.sleep(PAGE_LOAD_WAIT)
 
-    # ۳) تایپ متن فارسی و زدن Enter
+    # ۳) در صورت وجود پنجره تأیید، آخرین Yes کلیک می‌شود
+    handle_dialog_if_present()
+
+    # ۴) تایپ متن فارسی و زدن Enter
     try:
         type_and_submit()
     except Exception as exc:
         # حتی اگر تایپ شکست خورد، ادامه می‌دهیم تا اسکرین‌شات وضعیت صفحه را ثبت کند
         print(f"خطا در تایپ/ارسال متن: {exc}")
 
-    # ۴) صبر کوتاه بعد از Enter تا نتیجه ارسال در صفحه دیده شود
+    # ۵) صبر کوتاه بعد از Enter تا نتیجه ارسال در صفحه دیده شود
     print(f"صبر {AFTER_ENTER_WAIT} ثانیه‌ای پیش از اسکرین‌شات...")
     time.sleep(AFTER_ENTER_WAIT)
 
-    # ۵) اطمینان از وجود پوشه و گرفتن اسکرین‌شات
+    # ۶) اطمینان از وجود پوشه و گرفتن اسکرین‌شات
     os.makedirs(SCREENSHOT_DIR, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     screenshot_path = os.path.join(
