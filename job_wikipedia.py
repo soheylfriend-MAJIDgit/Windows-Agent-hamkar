@@ -53,17 +53,23 @@ $graphics.Dispose()
 $bitmap.Dispose()
 """.strip()
 
+    # CREATE_NO_WINDOW + WindowStyle Hidden: پنجره پاورشل روی صفحه باز نمی‌شود
+    # تا مرورگر در لحظه اسکرین‌شات در پیش‌زمینه بماند و روی عکس دیده شود.
+    creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     result = subprocess.run(
         [
             "powershell.exe",
             "-NoProfile",
             "-NonInteractive",
+            "-WindowStyle",
+            "Hidden",
             "-Command",
             ps_script,
         ],
         capture_output=True,
         text=True,
         timeout=60,
+        creationflags=creation_flags,
     )
 
     if result.returncode != 0:
