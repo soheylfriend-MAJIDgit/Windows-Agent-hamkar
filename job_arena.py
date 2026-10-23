@@ -2,11 +2,12 @@
 # کار این فایل:
 #   ۱) باز کردن لینک صفحه Arena در مرورگر پیش‌فرض
 #   ۲) صبر برای بارگذاری کامل صفحه (با فاصله زمانی)
-#   ۳) بررسی وجود پنجره "Was this task successful?":
+#   ۳) بررسی حالت پنجره مرورگر: اگر تمام‌صفحه (Maximized) نبود، اول Maximize می‌شود
+#   ۴) بررسی وجود پنجره "Was this task successful?":
 #        - اگر نبود → مستقیم سراغ تایپ می‌رود
 #        - اگر بود → آخرین دکمه "Yes" را کلیک می‌کند، کمی صبر می‌کند، بعد تایپ می‌کند
-#   ۴) تایپ متن فارسی در کادر چت و زدن Enter
-#   ۵) گرفتن اسکرین‌شات در پایان
+#   ۵) تایپ متن فارسی در کادر چت و زدن Enter
+#   ۶) گرفتن اسکرین‌شات در پایان
 # فقط کتابخانه‌های استاندارد پایتون — بدون نیاز به pip install.
 # بدون ورودی تعاملی (input) و بدون انتظار برای بسته شدن مرورگر.
 #
@@ -45,6 +46,9 @@ DIALOG_CHECK_GAP = 3
 
 # صبر بعد از کلیک روی Yes، پیش از تایپ
 DIALOG_CLICK_WAIT = 3
+
+# صبر بعد از Maximize کردن مرورگر تا چیدمان صفحه تثبیت شود
+MAXIMIZE_WAIT = 2
 
 # صبر بعد از زدن Enter، پیش از گرفتن اسکرین‌شات
 AFTER_ENTER_WAIT = 5
@@ -99,6 +103,95 @@ def run_hidden_powershell(ps_script, extra_env=None, timeout=60):
         raise RuntimeError(error)
 
     return result.stdout or ""
+
+
+# اسکریپت UI Automation برای اطمینان از تمام‌صفحه (Maximize) بودن مرورگر:
+#   - پنجره مرورگر فعال (یا آخرین مرورگر) پیدا می‌شود
+#   - اگر از قبل Maximized بود کاری نمی‌کند
+#   - وگرنه با WindowPattern و در صورت نیاز ShowWindow ویندوزی، Maximize می‌کند
+# خروجی: ARENA_ALREADY_MAXIMIZED / ARENA_WINDOW_MAXIMIZED /
+# ARENA_WINDOW_MAXIMIZED_FALLBACK / ARENA_NO_BROWSER
+MAXIMIZE_PS_SCRIPT = r"""
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
+Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+public class WinMax {
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")]
+    public static extern bool SetForegroundWindow(IntPtr hWnd);
+    [DllImport("user32.dll")]
+    public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+}
+'@
+
+$browserNames = @('chrome','msedge','firefox','brave','opera','vivaldi')
+$root = [System.Windows.Automation.AutomationElement]::RootElement
+$topWindows = $root.FindAll([System.Windows.Automation.TreeScope]::Children, [System.Windows.Automation.Condition]::TrueCondition)
+
+$foregroundHandle = [WinMax]::GetForegroundWindow()
+$browserWin = $null
+$lastBrowser = $null
+foreach ($win in $topWindows) {
+    $proc = Get-Process -Id $win.Current.ProcessId -ErrorAction SilentlyContinue
+    if ($proc -and ($browserNames -contains $proc.ProcessName)) {
+        $lastBrowser = $win
+        if ($win.Current.NativeWindowHandle -eq $foregroundHandle) { $browserWin = $win }
+    }
+}
+if (-not $browserWin) { $browserWin = $lastBrowser }
+if (-not $browserWin) { Write-Output 'ARENA_NO_BROWSER'; exit 0 }
+
+$handle = $browserWin.Current.NativeWindowHandle
+try { [WinMax]::SetForegroundWindow($handle) | Out-Null } catch {}
+
+# WindowVisualState: 0=Normal, 1=Maximized, 2=Minimized
+$winPattern = $null
+$hasPattern = $browserWin.TryGetCurrentPattern([System.Windows.Automation.WindowPattern]::Pattern, [ref]$winPattern)
+if ($hasPattern -and $winPattern) {
+    if ($winPattern.Current.WindowVisualState -eq [System.Windows.Automation.WindowVisualState]::Maximized) {
+        Write-Output 'ARENA_ALREADY_MAXIMIZED'
+        exit 0
+    }
+    try {
+        $winPattern.SetWindowVisualState([System.Windows.Automation.WindowVisualState]::Maximized)
+        Write-Output 'ARENA_WINDOW_MAXIMIZED'
+        exit 0
+    } catch {}
+}
+
+# راهبرد جایگزین: ShowWindow ویندوزی با SW_MAXIMIZE = 3
+try {
+    [WinMax]::ShowWindow($handle, 3) | Out-Null
+    Write-Output 'ARENA_WINDOW_MAXIMIZED_FALLBACK'
+} catch {
+    Write-Output 'ARENA_MAXIMIZE_FAILED'
+}
+exit 0
+"""
+
+
+def maximize_browser():
+    print("بررسی حالت تمام‌صفحه بودن پنجره مرورگر...")
+    try:
+        output = run_hidden_powershell(MAXIMIZE_PS_SCRIPT)
+    except Exception as exc:
+        # خطای Maximize نباید بقیه کار را متوقف کند
+        print(f"هشدار: بررسی/Maximize مرورگر با خطا مواجه شد: {exc}")
+        return
+
+    if "ARENA_ALREADY_MAXIMIZED" in output:
+        print("پنجره مرورگر از قبل تمام‌صفحه (Maximized) است")
+    elif "ARENA_WINDOW_MAXIMIZED" in output or "ARENA_WINDOW_MAXIMIZED_FALLBACK" in output:
+        print("پنجره مرورگر تمام‌صفحه (Maximize) شد")
+        print(f"صبر {MAXIMIZE_WAIT} ثانیه‌ای برای تثبیت چیدمان صفحه...")
+        time.sleep(MAXIMIZE_WAIT)
+    elif "ARENA_NO_BROWSER" in output:
+        print("هشدار: پنجره مرورگری برای Maximize پیدا نشد")
+    else:
+        print("هشدار: Maximize مرورگر قطعی تأیید نشد؛ ادامه می‌دهیم")
 
 
 # اسکریپت UI Automation:
@@ -581,21 +674,24 @@ def main():
     print(f"صبر {PAGE_LOAD_WAIT} ثانیه‌ای برای بارگذاری کامل صفحه...")
     time.sleep(PAGE_LOAD_WAIT)
 
-    # ۳) در صورت وجود پنجره تأیید، آخرین Yes کلیک می‌شود
+    # ۳) اطمینان از تمام‌صفحه (Maximize) بودن پنجره مرورگر پیش از هر اقدام دیگری
+    maximize_browser()
+
+    # ۴) در صورت وجود پنجره تأیید، آخرین Yes کلیک می‌شود
     handle_dialog_if_present()
 
-    # ۴) تایپ متن فارسی و زدن Enter
+    # ۵) تایپ متن فارسی و زدن Enter
     try:
         type_and_submit()
     except Exception as exc:
         # حتی اگر تایپ شکست خورد، ادامه می‌دهیم تا اسکرین‌شات وضعیت صفحه را ثبت کند
         print(f"خطا در تایپ/ارسال متن: {exc}")
 
-    # ۵) صبر کوتاه بعد از Enter تا نتیجه ارسال در صفحه دیده شود
+    # ۶) صبر کوتاه بعد از Enter تا نتیجه ارسال در صفحه دیده شود
     print(f"صبر {AFTER_ENTER_WAIT} ثانیه‌ای پیش از اسکرین‌شات...")
     time.sleep(AFTER_ENTER_WAIT)
 
-    # ۶) اطمینان از وجود پوشه و گرفتن اسکرین‌شات
+    # ۷) اطمینان از وجود پوشه و گرفتن اسکرین‌شات
     os.makedirs(SCREENSHOT_DIR, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     screenshot_path = os.path.join(
