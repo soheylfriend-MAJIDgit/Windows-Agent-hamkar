@@ -446,6 +446,15 @@ def handle_dialog_if_present():
 #   ۵) قبل از Paste، محتوای کلیپ‌بورد خوانده و تأیید می‌شود که واقعاً متن پرامپت را دارد
 #   ۶) چهار مسیر Paste: سخت‌افزاری، SendKeys فرم‌ها، WScript.Shell، Shift+Insert
 #   ۷) تأیید غیرمخرب با ValuePattern/TextPattern؛ در نبود آن، SelectAll+Copy و سپس End
+# اسکریپت تایپ و ارسال (نسخه مقاوم‌شده ۲ — همه‌کلید‌سخت‌افزاری):
+#   ۱) مرورگر Foreground و در صورت انحراف قطعی از arena.ai لینک دوباره باز می‌شود
+#   ۲) بنر «Updated in another tab» با F5 سخت‌افزاری ری‌لود می‌شود (بدون تب جدید)
+#   ۳) کادر چت با placeholder / سند پایین صفحه / Edit صفحه / هندسی پیدا و فیزیکی کلیک می‌شود
+#   ۴) عنصر واقعی فوکوس گرفته می‌شود و محافظ نوار آدرس، کلیک را تکرار می‌کند
+#   ۵) قبل هر تلاش، کادر با Ctrl+A و Delete سخت‌افزاری قطعی خالی می‌شود (جلوگیری از انباشت متن)
+#   ۶) کلیپ‌بورد قبل Paste با خواندن مجدد تأیید می‌شود؛ سه مسیر Paste متفاوت
+#   ۷) تأیید با Ctrl+A/Ctrl+C سخت‌افزاری و بررسی Contains (نه برابری دقیق) + گزارش طول متن
+#   ۸) ارسال با Enter سخت‌افزاری و تأیید با بازگشت placeholder یا خالی‌شدن کادر
 TYPE_PS_SCRIPT = r"""
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
@@ -476,21 +485,29 @@ function Left-Click($x, $y) {
     [WinApi]::mouse_event(4, 0, 0, 0, 0)
 }
 
-function Hardware-Paste {
+function Tap-Key($vk, $scan) {
+    [WinApi]::keybd_event($vk, $scan, 0, [UIntPtr]::Zero)
+    Start-Sleep -Milliseconds 60
+    [WinApi]::keybd_event($vk, $scan, 2, [UIntPtr]::Zero)
+}
+
+function Ctrl-Tap($vk, $scan) {
     [WinApi]::keybd_event(0x11, 0x1D, 0, [UIntPtr]::Zero)
-    Start-Sleep -Milliseconds 90
-    [WinApi]::keybd_event(0x56, 0x2F, 0, [UIntPtr]::Zero)
-    Start-Sleep -Milliseconds 90
-    [WinApi]::keybd_event(0x56, 0x2F, 2, [UIntPtr]::Zero)
-    Start-Sleep -Milliseconds 90
+    Start-Sleep -Milliseconds 70
+    [WinApi]::keybd_event($vk, $scan, 0, [UIntPtr]::Zero)
+    Start-Sleep -Milliseconds 70
+    [WinApi]::keybd_event($vk, $scan, 2, [UIntPtr]::Zero)
+    Start-Sleep -Milliseconds 70
     [WinApi]::keybd_event(0x11, 0x1D, 2, [UIntPtr]::Zero)
 }
 
-function Hardware-Enter {
-    [WinApi]::keybd_event(0x0D, 0x1C, 0, [UIntPtr]::Zero)
-    Start-Sleep -Milliseconds 90
-    [WinApi]::keybd_event(0x0D, 0x1C, 2, [UIntPtr]::Zero)
-}
+function Hardware-SelectAll { Ctrl-Tap 0x41 0x1E }   # Ctrl+A
+function Hardware-Copy { Ctrl-Tap 0x43 0x2E }        # Ctrl+C
+function Hardware-Paste { Ctrl-Tap 0x56 0x2F }       # Ctrl+V
+function Hardware-Delete { Tap-Key 0x2E 0x53 }       # Delete
+function Hardware-End { Tap-Key 0x23 0x4F }          # End
+function Hardware-Reload { Tap-Key 0x74 0x3F }       # F5
+function Hardware-Enter { Tap-Key 0x0D 0x1C }        # Enter
 
 function Get-ElText($el) {
     if (-not $el) { return $null }
@@ -541,28 +558,75 @@ function Get-ClickPoint($el) {
 }
 
 # کلیپ‌بورد را طوری تنظیم می‌کند که خودش هم با خواندن مجدد تأیید شود
-# توجه: مارکرها اینجا Write-Output نمی‌شوند تا با مقدار بازگشتی تابع مخلوط نشوند
 function Set-Clipboard-Verified($text) {
     for ($i = 1; $i -le 3; $i++) {
         try { Set-Clipboard -Value $text } catch { Start-Sleep -Milliseconds 200; continue }
         Start-Sleep -Milliseconds 250
         $check = [string](Get-Clipboard -Raw)
-        if ($check -and $check.TrimEnd("`r","`n") -eq $text.TrimEnd("`r","`n")) {
-            return $true
-        }
+        if ($check -and $check.TrimEnd("`r","`n") -eq $text.TrimEnd("`r","`n")) { return $true }
         Start-Sleep -Milliseconds 250
     }
     return $false
 }
 
-function Test-PromptPresent($el) {
-    $t = Get-ElText $el
-    if ($t -and $t.Contains($env:ARENA_PROMPT)) { return $true }
+# ریست قطعی کادر: انتخاب همه + Delete با کلید سخت‌افزاری (روی کادر خالی هم بی‌خطر است)
+function Reset-Box {
+    Hardware-SelectAll
+    Start-Sleep -Milliseconds 150
+    Hardware-Delete
+    Start-Sleep -Milliseconds 300
+    Write-Output 'ARENA_RESET_DONE'
+}
+
+# تأیید حضور متن با کپی سخت‌افزاری؛ Contains به‌جای برابری دقیق تا متن تکراری هم رد نشود
+function Test-PromptInBox {
+    $sentinel = "__ARENA_V_$([Guid]::NewGuid().ToString('N'))__"
+    Set-Clipboard -Value $sentinel
+    Hardware-SelectAll
+    Start-Sleep -Milliseconds 150
+    Hardware-Copy
+    Start-Sleep -Milliseconds 450
+    $copied = [string](Get-Clipboard -Raw)
+    Hardware-End
+    Start-Sleep -Milliseconds 150
+    if ($copied -and $copied.Contains($env:ARENA_PROMPT)) {
+        Write-Output ("ARENA_VERIFY_HIT_LEN" + $copied.Length)
+        return $true
+    }
+    Write-Output ("ARENA_VERIFY_MISS_LEN" + $copied.Length)
+    return $false
+}
+
+# تأیید ارسال: بازگشت placeholder (کادر خالی) یا دست‌نخوردن ماندن سنتینل کلیپ‌بورد
+function Test-BoxCleared($page, $textCond) {
+    try {
+        $ts = Get-Visible ($page.FindAll([System.Windows.Automation.TreeScope]::Descendants, $textCond))
+        foreach ($t in $ts) {
+            $n = [string]$t.Current.Name
+            if ($n -and ($n -match 'What would you like')) {
+                Write-Output 'ARENA_SEND_VERIFY_PLACEHOLDER'
+                return $true
+            }
+        }
+    } catch {}
+    $sentinel = "__ARENA_E_$([Guid]::NewGuid().ToString('N'))__"
+    Set-Clipboard -Value $sentinel
+    Hardware-SelectAll
+    Start-Sleep -Milliseconds 150
+    Hardware-Copy
+    Start-Sleep -Milliseconds 450
+    $copied = [string](Get-Clipboard -Raw)
+    Hardware-End
+    Start-Sleep -Milliseconds 150
+    if (-not $copied -or $copied.Trim().Length -eq 0 -or $copied -eq $sentinel) {
+        Write-Output 'ARENA_SEND_VERIFY_EMPTY'
+        return $true
+    }
+    Write-Output ("ARENA_SEND_VERIFY_STILL_LEN" + $copied.Length)
     return $false
 }
 
 $browserNames = @('chrome','msedge','firefox','brave','opera','vivaldi')
-$composer = $null
 $clickPoint = $null
 $page = $null
 $browserWin = $null
@@ -570,7 +634,7 @@ $winRect = $null
 $pageRect = $null
 $textConfirmed = $false
 
-for ($round = 1; $round -le 2 -and -not $textConfirmed; $round++) {
+for ($round = 1; $round -le 3 -and -not $textConfirmed; $round++) {
     $root = [System.Windows.Automation.AutomationElement]::RootElement
     $topWindows = $root.FindAll([System.Windows.Automation.TreeScope]::Children, [System.Windows.Automation.Condition]::TrueCondition)
 
@@ -597,14 +661,14 @@ for ($round = 1; $round -le 2 -and -not $textConfirmed; $round++) {
     $textCond = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Text)
     $winEdits = Get-Visible ($browserWin.FindAll([System.Windows.Automation.TreeScope]::Descendants, $editCond))
 
-    # نگهبان URL
+    # نگهبان URL فقط وقتی متن نوار آدرس خوانا و قطعاً خارج از arena.ai باشد
     $omnibox = $null
     foreach ($e in $winEdits) {
         if (Test-Omnibox $e $winRect.Top) { $omnibox = $e; break }
     }
     if ($omnibox) {
         $urlText = Get-ElText $omnibox
-        if ($urlText -and ($urlText -notmatch 'arena\.ai')) {
+        if ($urlText -and $urlText.Trim().Length -gt 5 -and ($urlText -notmatch 'arena\.ai')) {
             Write-Output 'ARENA_URL_GUARD_REOPEN'
             Start-Process $env:ARENA_URL | Out-Null
             Start-Sleep -Seconds 12
@@ -623,8 +687,23 @@ for ($round = 1; $round -le 2 -and -not $textConfirmed; $round++) {
     if (-not $page) { $page = $browserWin }
     $pageRect = $page.Current.BoundingRectangle
 
-    # الف) placeholder
     $texts = Get-Visible ($page.FindAll([System.Windows.Automation.TreeScope]::Descendants, $textCond))
+
+    # بنر کهنگی تب: به‌جای بازکردن تب جدید، همین تب با F5 ری‌لود می‌شود
+    $stale = $false
+    foreach ($t in $texts) {
+        $n = [string]$t.Current.Name
+        if ($n -and ($n -match 'Updated in another tab')) { $stale = $true; break }
+    }
+    if ($stale) {
+        Write-Output 'ARENA_STALE_RELOAD'
+        Hardware-Reload
+        Start-Sleep -Seconds 10
+        continue
+    }
+
+    $clickPoint = $null
+    # الف) placeholder
     $placeholder = $null
     foreach ($t in $texts) {
         $n = [string]$t.Current.Name
@@ -635,7 +714,6 @@ for ($round = 1; $round -le 2 -and -not $textConfirmed; $round++) {
         $cx = $pr.X + [Math]::Min(120, $pr.Width / 2)
         $cy = $pr.Y + $pr.Height / 2
         $clickPoint = New-Object System.Windows.Point($cx, $cy)
-        $composer = $placeholder
         Write-Output 'ARENA_COMPOSER_PLACEHOLDER'
     }
     # ب) سند باریک پایین صفحه
@@ -650,7 +728,6 @@ for ($round = 1; $round -le 2 -and -not $textConfirmed; $round++) {
             }
         }
         if ($best) {
-            $composer = $best
             $clickPoint = Get-ClickPoint $best
             Write-Output 'ARENA_COMPOSER_BOTTOM_DOC'
         }
@@ -680,14 +757,13 @@ for ($round = 1; $round -le 2 -and -not $textConfirmed; $round++) {
         Write-Output 'ARENA_COMPOSER_GEOMETRY_FALLBACK'
     }
 
-    # حلقه تلاش: هر بار کلیک تمیز، گرفتن هدف واقعی فوکوس، و یک مسیر Paste متفاوت
     for ($try = 1; $try -le 3 -and -not $textConfirmed; $try++) {
         try { [WinApi]::SetForegroundWindow($browserWin.Current.NativeWindowHandle) | Out-Null } catch {}
         Start-Sleep -Milliseconds 300
         Left-Click $clickPoint.X $clickPoint.Y
         Start-Sleep -Milliseconds 650
 
-        # هدف واقعی ویرایش = عنصری که بعد از کلیک فوکوس گرفته؛ با محافظ نوار آدرس
+        # محافظ نوار آدرس: اگر فوکوس روی omnibox افتاد کلیک تکرار می‌شود
         $focused = [System.Windows.Automation.AutomationElement]::FocusedElement
         for ($guard = 0; $guard -lt 2 -and (Test-Omnibox $focused $winRect.Top); $guard++) {
             Write-Output 'ARENA_FOCUS_RECLICK'
@@ -697,30 +773,23 @@ for ($round = 1; $round -le 2 -and -not $textConfirmed; $round++) {
         }
         if ($focused) { Write-Output 'ARENA_FOCUS_OK' }
 
-        # در تلاش‌های بعدی، فقط اگر متنی واقعاً مانده پاک می‌کنیم (نه روی کادر خالی)
-        if ($try -gt 1 -and (Test-PromptPresent $focused)) {
-            try {
-                [System.Windows.Forms.SendKeys]::SendWait('^a')
-                Start-Sleep -Milliseconds 120
-                [System.Windows.Forms.SendKeys]::SendWait('{DEL}')
-                Start-Sleep -Milliseconds 250
-            } catch {}
-        }
+        # ریست قطعی پیش از هر تلاش تا متن تلاش قبلی انباشته نشود
+        Reset-Box
 
-        # مسیر A: نوشتن مستقیم با ValuePattern روی هدف فوکوس (بدون کلیپ‌بورد)
+        # مسیر A: نوشتن مستقیم با ValuePattern (بدون کلیپ‌بورد) — اگر عنصر پشتیبانی کند
         try {
             $vp = $null
             if ($focused -and $focused.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$vp)) {
                 $vp.SetValue($env:ARENA_PROMPT)
                 Start-Sleep -Milliseconds 500
-                if (Test-PromptPresent $focused) {
+                if (Test-PromptInBox) {
                     $textConfirmed = $true
                     Write-Output ("ARENA_VALUE_VERIFIED_TRY" + $try)
                 }
             }
         } catch {}
 
-        # مسیر B: کلیپ‌بورد با تأیید قبل از Paste
+        # مسیر B: کلیپ‌بورد با تأیید قبل از Paste و تأیید سخت‌افزاری بعد از آن
         if (-not $textConfirmed) {
             $clipOk = Set-Clipboard-Verified $env:ARENA_PROMPT
             if ($clipOk) { Write-Output 'ARENA_CLIPBOARD_READY' } else { Write-Output 'ARENA_CLIPBOARD_UNVERIFIED' }
@@ -738,28 +807,9 @@ for ($round = 1; $round -le 2 -and -not $textConfirmed; $round++) {
                     Write-Output 'ARENA_PASTE_WSHELL_SHIFTINSERT'
                 }
                 Start-Sleep -Milliseconds 1100
-
-                # تأیید غیرمخرب از روی الگوهای عنصر فوکوس
-                if (Test-PromptPresent $focused) {
+                if (Test-PromptInBox) {
                     $textConfirmed = $true
-                    Write-Output ("ARENA_VERIFY_PATTERN_TRY" + $try)
-                } else {
-                    # تأیید از راه انتخاب همه و کپی (پایان با End تا چیزی پاک نشود)
-                    try {
-                        $sentinel = "__ARENA_VERIFY_$([Guid]::NewGuid().ToString('N'))__"
-                        Set-Clipboard -Value $sentinel
-                        [System.Windows.Forms.SendKeys]::SendWait('^a')
-                        Start-Sleep -Milliseconds 150
-                        [System.Windows.Forms.SendKeys]::SendWait('^c')
-                        Start-Sleep -Milliseconds 400
-                        $copied = [string](Get-Clipboard -Raw)
-                        [System.Windows.Forms.SendKeys]::SendWait('{END}')
-                        Start-Sleep -Milliseconds 200
-                        if ($copied -and $copied.TrimEnd("`r","`n") -eq $env:ARENA_PROMPT.TrimEnd("`r","`n")) {
-                            $textConfirmed = $true
-                            Write-Output ("ARENA_VERIFY_CLIPBOARD_TRY" + $try)
-                        }
-                    } catch {}
+                    Write-Output ("ARENA_PASTE_VERIFIED_TRY" + $try)
                 }
             }
         }
@@ -775,19 +825,16 @@ $sent = $false
 if ($textConfirmed) {
     # ۱) Enter سخت‌افزاری
     Hardware-Enter
-    Start-Sleep -Milliseconds 1300
-    $focused = [System.Windows.Automation.AutomationElement]::FocusedElement
-    $afterText = Get-ElText $focused
-    if (-not $afterText -or -not $afterText.Contains($env:ARENA_PROMPT)) {
+    Start-Sleep -Milliseconds 1500
+    if (Test-BoxCleared $page $textCond) {
         $sent = $true
         Write-Output 'ARENA_SUBMIT_ENTER'
     }
 
     # ۲) دکمه Send
     if (-not $sent) {
-        $scope = $page
         $btnCond = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, [System.Windows.Automation.ControlType]::Button)
-        $buttons = Get-Visible ($scope.FindAll([System.Windows.Automation.TreeScope]::Descendants, $btnCond))
+        $buttons = Get-Visible ($page.FindAll([System.Windows.Automation.TreeScope]::Descendants, $btnCond))
         $sendBtn = $null
         foreach ($b in $buttons) {
             $n = [string]$b.Current.Name
@@ -813,10 +860,8 @@ if ($textConfirmed) {
                     $pt = Get-ClickPoint $sendBtn
                     Left-Click $pt.X $pt.Y
                 }
-                Start-Sleep -Milliseconds 1300
-                $focused = [System.Windows.Automation.AutomationElement]::FocusedElement
-                $afterText = Get-ElText $focused
-                if (-not $afterText -or -not $afterText.Contains($env:ARENA_PROMPT)) {
+                Start-Sleep -Milliseconds 1500
+                if (Test-BoxCleared $page $textCond) {
                     $sent = $true
                     Write-Output 'ARENA_SUBMIT_BUTTON'
                 }
@@ -828,10 +873,8 @@ if ($textConfirmed) {
     if (-not $sent) {
         try {
             [System.Windows.Forms.SendKeys]::SendWait('~')
-            Start-Sleep -Milliseconds 1300
-            $focused = [System.Windows.Automation.AutomationElement]::FocusedElement
-            $afterText = Get-ElText $focused
-            if (-not $afterText -or -not $afterText.Contains($env:ARENA_PROMPT)) {
+            Start-Sleep -Milliseconds 1500
+            if (Test-BoxCleared $page $textCond) {
                 $sent = $true
                 Write-Output 'ARENA_SUBMIT_SENDKEYS'
             }
@@ -859,6 +902,8 @@ def type_and_submit():
         print("هشدار: پنجره مرورگر برای تایپ پیدا نشد")
     if "ARENA_URL_GUARD_REOPEN" in output:
         print("هشدار: تب از صفحه Arena خارج شده بود؛ لینک دوباره باز شد")
+    if "ARENA_STALE_RELOAD" in output:
+        print("هشدار: تب کهنه شده بود؛ همان تب با F5 بارگذاری تازه شد")
 
     if "ARENA_COMPOSER_PLACEHOLDER" in output:
         print("کادر چت از روی متن «What would you like to do?» پیدا و کلیک شد")
