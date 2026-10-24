@@ -19,7 +19,10 @@
 # نکته فنی ۳: کادر چت با متن placeholder و موقعیت پایین صفحه پیدا می‌شود تا نه با
 # نوار آدرس و نه با سند بزرگ کل صفحه اشتباه گرفته شود.
 
+import json
 import os
+import traceback
+import urllib.request
 import subprocess
 import time
 import webbrowser
@@ -28,7 +31,7 @@ from datetime import datetime
 URL = "https://arena.ai/agent/01a16a94-648c-7294-8d19-f276beecb74c"
 
 # متنی که باید در کادر چت تایپ و ارسال شود
-PROMPT_TEXT = "یک کد دیگه بنویس که سایت ورسل رو باز کنه"
+PROMPT_TEXT = "ی گزارش از وضعیت دسکتاپ درست کن. اسم فایل نوت پدش رو بذار Windows Situation و در دسکتاپ قرار بده."
 
 # عبارتی که قبل از تایپ باید در صفحه بررسی شود
 DIALOG_PHRASE = "Was this task successful?"
@@ -56,6 +59,48 @@ MAXIMIZE_WAIT = 2
 
 # صبر بعد از زدن Enter، پیش از گرفتن اسکرین‌شات
 AFTER_ENTER_WAIT = 5
+
+
+# management-arena-bridge: 1
+# گزارش نتیجه از راه صف محلی رباتِ خود Windows Agent ارسال می‌شود؛
+# هیچ توکن تلگرامی داخل این فایل یا گیت‌هاب قرار نمی‌گیرد.
+TELEGRAM_REPORT_MODE = "start_final"
+PROMPT_REQUEST_ID = "20261024181843-80da05"
+BOT_API_CONFIG = os.path.join(
+    os.environ.get("LOCALAPPDATA", ""), "Windows-Agent", "bot_api.json"
+)
+
+
+def send_telegram_status(kind, detail):
+    """گزارش را به مقصد پیش‌فرض ربات می‌فرستد؛ شکست تلگرام اجرای کار را خراب نمی‌کند."""
+    if TELEGRAM_REPORT_MODE == "off":
+        return False
+    try:
+        with open(BOT_API_CONFIG, encoding="utf-8") as fh:
+            cfg = json.load(fh)
+        text = (
+            f"[Arena / {kind}]\n"
+            f"درخواست: {PROMPT_REQUEST_ID}\n"
+            f"پرامپت: {PROMPT_TEXT[:700]}\n"
+            f"جزئیات: {str(detail)[:1800]}"
+        )
+        body = json.dumps({"text": text, "delay": 0, "chat_id": None}).encode("utf-8")
+        request = urllib.request.Request(
+            cfg["send"],
+            data=body,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "X-Agent-Token": cfg["token"],
+            },
+        )
+        with urllib.request.urlopen(request, timeout=10) as response:
+            response.read()
+        print(f"گزارش تلگرام در صف قرار گرفت: {kind}")
+        return True
+    except Exception as exc:
+        print(f"هشدار: ثبت گزارش تلگرام ممکن نشد: {exc}")
+        return False
 
 
 def open_site():
@@ -660,12 +705,12 @@ def type_and_submit():
     if "ARENA_TEXT_VERIFIED" in output:
         print("حضور متن در کادر چت با خواندن عنصر فوکوس‌شده تأیید شد")
     else:
-        print("هشدار: حضور متن در کادر چت تأیید نشد")
+        raise RuntimeError("حضور متن در کادر چت تأیید نشد")
 
     if "ARENA_SENT_VERIFIED" in output:
         print("ارسال پیام تأیید شد (متن بعد از ارسال از کادر پاک شد)")
     else:
-        print("هشدار: ارسال پیام قطعی تأیید نشد؛ اسکرین‌شات را بررسی کنید")
+        raise RuntimeError("ارسال پیام در Arena قطعی تأیید نشد")
 
     if markers:
         print("گزارش فنی: " + " | ".join(markers))
@@ -687,7 +732,7 @@ $bitmap.Dispose()
     run_hidden_powershell(ps_script)
 
 
-def main():
+def _run_arena_task():
     # ۱) باز کردن لینک
     open_site()
 
@@ -706,6 +751,7 @@ def main():
         type_and_submit()
     except Exception as exc:
         print(f"خطا در تایپ/ارسال متن: {exc}")
+        raise
 
     # ۶) صبر کوتاه بعد از Enter تا نتیجه ارسال در صفحه دیده شود
     print(f"صبر {AFTER_ENTER_WAIT} ثانیه‌ای پیش از اسکرین‌شات...")
@@ -723,6 +769,25 @@ def main():
         print(f"اسکرین‌شات ذخیره شد: {screenshot_path}")
     except Exception as exc:
         print(f"خطا در گرفتن اسکرین‌شات: {exc}")
+        raise
+
+
+
+def main():
+    started_at = datetime.now()
+    if TELEGRAM_REPORT_MODE == "start_final":
+        send_telegram_status("شروع", "اجرای پرامپت در ویندوز آغاز شد.")
+    try:
+        _run_arena_task()
+    except BaseException as exc:
+        elapsed = (datetime.now() - started_at).total_seconds()
+        summary = f"پس از {elapsed:.1f} ثانیه ناموفق شد: {type(exc).__name__}: {exc}"
+        print(summary)
+        send_telegram_status("ناموفق", summary + "\n" + traceback.format_exc()[-1200:])
+        raise
+    else:
+        elapsed = (datetime.now() - started_at).total_seconds()
+        send_telegram_status("موفق", f"پرامپت پس از {elapsed:.1f} ثانیه تایپ و ارسال شد.")
 
 
 if __name__ == "__main__":
