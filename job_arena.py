@@ -31,7 +31,7 @@ from datetime import datetime
 URL = "https://arena.ai/agent/01a16a94-648c-7294-8d19-f276beecb74c"
 
 # متنی که باید در کادر چت تایپ و ارسال شود
-PROMPT_TEXT = "ی گزارش از وضعیت ویندوز پوهش های یکه باز هستن . و برنامه \nاولش تاریخ و ساعت جلالی بزن در یک فایل txt در دسکتاپ بذار"
+PROMPT_TEXT = "ازت میخوام یک نامه عاشقانه کوتاه بنویسی و در این پوشه: \nC:\\Users\\alibatel\\My Drive\\Windows-Agent-DB\\TESTS\nذخیره کنی."
 
 # عبارتی که قبل از تایپ باید در صفحه بررسی شود
 DIALOG_PHRASE = "Was this task successful?"
@@ -61,11 +61,11 @@ MAXIMIZE_WAIT = 2
 AFTER_ENTER_WAIT = 5
 
 
-# management-arena-bridge: 2
+# management-arena-bridge: 3
 # گزارش نتیجه از راه صف محلی رباتِ خود Windows Agent ارسال می‌شود؛
 # هیچ توکن تلگرامی داخل این فایل یا گیت‌هاب قرار نمی‌گیرد.
 TELEGRAM_REPORT_MODE = "final"
-PROMPT_REQUEST_ID = "20261024184338-1c8c9f"
+PROMPT_REQUEST_ID = "20261024185650-71e3ce"
 FAILURE_FEEDBACK_ATTEMPTS = 3
 BOT_API_CONFIG = os.path.join(
     os.environ.get("LOCALAPPDATA", ""), "Windows-Agent", "bot_api.json"
@@ -119,7 +119,7 @@ def save_failure_artifacts(detail):
             fh.write(
                 "زمان: " + datetime.now().strftime("%Y-%m-%d %H:%M:%S") + " تهران\n"
                 "موضوع: شکست job_arena.py و نیاز به بررسی ایجنت همکار\n"
-                "نسخه برنامه: Arena Bridge 2\n"
+                "نسخه برنامه: Arena Bridge 3\n"
                 "شناسه درخواست: " + PROMPT_REQUEST_ID + "\n"
                 "پرامپت: " + PROMPT_TEXT + "\n\n"
                 "جزئیات خطا:\n" + str(detail)
@@ -651,26 +651,64 @@ for ($round = 1; $round -le 2 -and -not $textConfirmed; $round++) {
         Write-Output 'ARENA_COMPOSER_GEOMETRY_FALLBACK'
     }
 
-    # حلقه تایپ: کلیک روی کادر → Paste → تأیید با خواندن متن عنصر فوکوس‌شده
+    # حلقه ورود متن: هر تلاش ابتدا کادر را پاک می‌کند و یک روش Paste متفاوت دارد.
+    # چون contenteditable کروم همیشه متن را از UI Automation برنمی‌گرداند، تأیید نهایی
+    # با Select All + Copy و مقایسه‌ی دقیق محتوای کپی‌شده انجام می‌شود.
     for ($try = 1; $try -le 3 -and -not $textConfirmed; $try++) {
         if ($composer) { try { $composer.SetFocus() } catch {} }
         Start-Sleep -Milliseconds 300
         Left-Click $clickPoint.X $clickPoint.Y
         Start-Sleep -Milliseconds 500
 
+        # متن باقی‌مانده از تلاش قبلی نباید باعث Paste تکراری شود.
+        try {
+            [System.Windows.Forms.SendKeys]::SendWait('^a')
+            Start-Sleep -Milliseconds 100
+            [System.Windows.Forms.SendKeys]::SendWait('{BACKSPACE}')
+        } catch {}
+
         Set-Clipboard -Value $env:ARENA_PROMPT
         Start-Sleep -Milliseconds 300
-        Hardware-Paste
+        if ($try -eq 1) {
+            Hardware-Paste
+            Write-Output 'ARENA_PASTE_HARDWARE'
+        } elseif ($try -eq 2) {
+            [System.Windows.Forms.SendKeys]::SendWait('^v')
+            Write-Output 'ARENA_PASTE_SENDKEYS'
+        } else {
+            [System.Windows.Forms.SendKeys]::SendWait('+{INSERT}')
+            Write-Output 'ARENA_PASTE_SHIFT_INSERT'
+        }
         Start-Sleep -Milliseconds 1000
 
-        # تأیید واقعی: متن از عنصری که الان فوکوس دارد خوانده می‌شود
         $focused = [System.Windows.Automation.AutomationElement]::FocusedElement
         $focusedText = Get-ElText $focused
         $composerText = Get-ElText $composer
-        $okFocused = ($focusedText -and $focusedText.Contains($env:ARENA_PROMPT))
-        $okComposer = ($composerText -and $composerText.Contains($env:ARENA_PROMPT))
-        if ($okFocused -or $okComposer) {
+        $promptNormalized = ([string]$env:ARENA_PROMPT).Replace("`r`n", "`n").TrimEnd([char[]]"`r`n")
+        $focusedNormalized = ([string]$focusedText).Replace("`r`n", "`n").TrimEnd([char[]]"`r`n")
+        $composerNormalized = ([string]$composerText).Replace("`r`n", "`n").TrimEnd([char[]]"`r`n")
+        $okFocused = ($focusedText -and $focusedNormalized.Contains($promptNormalized))
+        $okComposer = ($composerText -and $composerNormalized.Contains($promptNormalized))
+
+        # مقدار قبلی Clipboard خود پرامپت است؛ قبل از Copy یک sentinel می‌گذاریم
+        # تا موفقیت Copy واقعاً ثابت کند متن داخل کادر قرار گرفته است.
+        $okCopied = $false
+        try {
+            $sentinel = "__ARENA_VERIFY_$([Guid]::NewGuid().ToString('N'))__"
+            Set-Clipboard -Value $sentinel
+            [System.Windows.Forms.SendKeys]::SendWait('^a')
+            Start-Sleep -Milliseconds 150
+            [System.Windows.Forms.SendKeys]::SendWait('^c')
+            Start-Sleep -Milliseconds 350
+            $copiedText = [string](Get-Clipboard -Raw)
+            $copiedNormalized = $copiedText.Replace("`r`n", "`n").TrimEnd([char[]]"`r`n")
+            $okCopied = ($copiedNormalized -eq $promptNormalized)
+            [System.Windows.Forms.SendKeys]::SendWait('{END}')
+        } catch {}
+
+        if ($okFocused -or $okComposer -or $okCopied) {
             $textConfirmed = $true
+            if ($okCopied) { Write-Output ("ARENA_SELECTION_COPY_VERIFIED_TRY" + $try) }
             Write-Output ("ARENA_PASTE_VERIFIED_TRY" + $try)
         } else {
             Write-Output ("ARENA_PASTE_UNVERIFIED_TRY" + $try)
@@ -851,6 +889,7 @@ def _run_arena_task():
     except Exception as exc:
         print(f"خطا در گرفتن اسکرین‌شات: {exc}")
         raise
+
 
 
 
