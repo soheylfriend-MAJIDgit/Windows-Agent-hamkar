@@ -31,7 +31,7 @@ from datetime import datetime
 URL = "https://arena.ai/agent/01a16a94-648c-7294-8d19-f276beecb74c"
 
 # متنی که باید در کادر چت تایپ و ارسال شود
-PROMPT_TEXT = "ازت میخوام یک نامه عاشقانه کوتاه بنویسی و در این پوشه: \nC:\\Users\\alibatel\\My Drive\\Windows-Agent-DB\\TESTS\nذخیره کنی."
+PROMPT_TEXT = "میخوام یک کد پایتون بنویسی که تمام فایل های موجود در دسکتاپ رو لیست کنه با سایزشون و بذاره توی فایل txt بذاره تو دسکتاپ."
 
 # عبارتی که قبل از تایپ باید در صفحه بررسی شود
 DIALOG_PHRASE = "Was this task successful?"
@@ -65,7 +65,7 @@ AFTER_ENTER_WAIT = 5
 # گزارش نتیجه از راه صف محلی رباتِ خود Windows Agent ارسال می‌شود؛
 # هیچ توکن تلگرامی داخل این فایل یا گیت‌هاب قرار نمی‌گیرد.
 TELEGRAM_REPORT_MODE = "final"
-PROMPT_REQUEST_ID = "20261024185650-71e3ce"
+PROMPT_REQUEST_ID = "20261024190051-34d513"
 FAILURE_FEEDBACK_ATTEMPTS = 3
 BOT_API_CONFIG = os.path.join(
     os.environ.get("LOCALAPPDATA", ""), "Windows-Agent", "bot_api.json"
